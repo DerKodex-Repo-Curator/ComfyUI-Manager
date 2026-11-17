@@ -10,6 +10,7 @@ import sys
 import subprocess
 import re
 import shutil
+import stat
 import configparser
 import platform
 from datetime import datetime
@@ -1304,12 +1305,31 @@ class UnifiedManager:
             clone_url = git_utils.get_url_for_clone(url)
             print(f"Download: git clone '{clone_url}'")
 
+            # this install makes the directory, so that what it removes after a clone that failed is its own:
+            # another install can make the directory after a check that it is not there
+            try:
+                os.makedirs(repo_path)
+                existed = False
+            except FileExistsError:
+                existed = True
             if not instant_execution and platform.system() == 'Windows':
-                res = manager_funcs.run_script([sys.executable, context.git_script_path, "--clone", get_default_custom_nodes_path(), clone_url, repo_path], cwd=get_default_custom_nodes_path())
+                try:
+                    res = manager_funcs.run_script([sys.executable, context.git_script_path, "--clone", get_default_custom_nodes_path(), clone_url, repo_path], cwd=get_default_custom_nodes_path())
+                except subprocess.CalledProcessError as e:
+                    # the default runner, which cm-cli has, raises for the exit code that the one of the server returns
+                    res = e.returncode
                 if res != 0:
+                    if not existed:
+                        remove_failed_clone(repo_path)
                     return result.fail(f"Failed to clone repo: {clone_url}")
             else:
-                repo = git.Repo.clone_from(clone_url, repo_path, recursive=True, progress=GitProgress())
+                try:
+                    repo = git.Repo.clone_from(clone_url, repo_path, recursive=True, progress=GitProgress())
+                except Exception:
+                    if not existed:
+                        remove_failed_clone(repo_path)
+                    raise
+
                 repo.git.clear_cache()
                 repo.close()
 
@@ -1726,7 +1746,8 @@ def read_config():
 
         return {
                     'http_channel_enabled': get_bool('http_channel_enabled', False),
-                    'git_exe': default_conf.get('git_exe', ''),
+                    # read as written: a path of Windows may hold a `%`, which the parser takes as the start of a reference
+                    'git_exe': default_conf.get('git_exe', '', raw=True),
                     'use_uv': get_bool('use_uv', True),
                     'channel_url': default_conf.get('channel_url', DEFAULT_CHANNEL),
                     'default_cache_as_channel_url': get_bool('default_cache_as_channel_url', False),
@@ -1979,7 +2000,9 @@ def __win_check_git_update(path, do_fetch=False, do_update=False):
 def __win_check_git_pull(path):
     command = [sys.executable, context.git_script_path, "--pull", path]
     process = subprocess.Popen(command, env=get_script_env(), cwd=get_default_custom_nodes_path())
-    process.wait()
+    # the helper ends with 1 when the pull failed
+    if process.wait() != 0:
+        raise ValueError(f"Failed to pull: {path}")
 
 
 def execute_install_script(url, repo_path, lazy_mode=False, instant_execution=False, no_deps=False):
@@ -2246,12 +2269,29 @@ async def gitclone_install(url, instant_execution=False, msg_prefix='', no_deps=
             # Clone the repository from the remote URL
             clone_url = git_utils.get_url_for_clone(url)
 
+            try:
+                # this install makes the directory, so that what it removes after a clone that failed is its own
+                os.makedirs(repo_path)
+            except FileExistsError:
+                # another install made it after the check above
+                return result.fail(f"Already exists: '{repo_path}'")
+
             if not instant_execution and platform.system() == 'Windows':
-                res = manager_funcs.run_script([sys.executable, context.git_script_path, "--clone", get_default_custom_nodes_path(), clone_url, repo_path], cwd=get_default_custom_nodes_path())
+                try:
+                    res = manager_funcs.run_script([sys.executable, context.git_script_path, "--clone", get_default_custom_nodes_path(), clone_url, repo_path], cwd=get_default_custom_nodes_path())
+                except subprocess.CalledProcessError as e:
+                    # the default runner, which cm-cli has, raises for the exit code that the one of the server returns
+                    res = e.returncode
                 if res != 0:
+                    remove_failed_clone(repo_path)
                     return result.fail(f"Failed to clone '{clone_url}' into  '{repo_path}'")
             else:
-                repo = git.Repo.clone_from(clone_url, repo_path, recursive=True, progress=GitProgress())
+                try:
+                    repo = git.Repo.clone_from(clone_url, repo_path, recursive=True, progress=GitProgress())
+                except Exception:
+                    remove_failed_clone(repo_path)
+                    raise
+
                 repo.git.clear_cache()
                 repo.close()
 
@@ -2280,6 +2320,8 @@ def git_pull(path):
             print(f"STASH: '{path}' is dirty.")
             repo.git.stash()
 
+        # the commit of a pack that is not on its branch
+        detached_at = repo.head.commit.hexsha if repo.head.is_detached else None
         if repo.head.is_detached:
             if not switch_to_default_branch(repo):
                 raise ValueError(f"Failed to switch to default branch while pulling: {path}")
@@ -2287,6 +2329,7 @@ def git_pull(path):
         current_branch = repo.active_branch
         remote_name = current_branch.tracking_branch().remote_name
         branch_name = current_branch.name
+        commit_hash = repo.head.commit.hexsha
 
         try:
             repo.git.pull('--ff-only')
@@ -2297,7 +2340,20 @@ def git_pull(path):
             repo.git.reset('--hard', f'{remote_name}/{branch_name}')
             logging.info(f"[ComfyUI-Manager] Reset to {remote_name}/{branch_name}")
 
-        repo.git.submodule('update', '--init', '--recursive')
+        try:
+            repo.git.submodule('update', '--init', '--recursive')
+        except Exception:
+            # the pull is undone: at the new commit the next update finds nothing to do, and the install script is never run
+            repo.git.reset('--hard', commit_hash)
+            if detached_at:
+                # a pack that was not on its branch goes back to its commit
+                repo.git.checkout(detached_at)
+            try:
+                # the submodules that were updated before the one that failed go back with it
+                repo.git.submodule('update', '--recursive')
+            except Exception:
+                pass
+            raise
 
         repo.close()
 
@@ -2377,6 +2433,22 @@ def gitclone_fix(files, instant_execution=False, no_deps=False):
 def pip_install(packages):
     install_cmd = ['#FORCE'] + manager_util.make_pip_cmd(["install", '-U']) + packages
     try_install_script('pip install via manager', '..', install_cmd)
+
+
+def remove_failed_clone(path):
+    """What a clone that failed left is in the way of the next install.
+
+    `rmtree`, which an uninstall uses, tries again and raises, also for a path that is not there."""
+    if platform.system() == 'Windows':
+        # there git makes its pack files read-only, and a read-only file is not removed
+        for directory, _, names in os.walk(path):
+            for name in names:
+                file = os.path.join(directory, name)
+                if not os.path.islink(file):
+                    os.chmod(file, stat.S_IWRITE)
+    shutil.rmtree(path, ignore_errors=True)
+    if os.path.exists(path):
+        logging.warning(f"[ComfyUI-Manager] What the clone that failed left could not be removed: '{path}'")
 
 
 def rmtree(path):
@@ -3514,11 +3586,12 @@ def resolve_giturl_from_path(fullpath):
     if not os.path.exists(git_config_path):
         return "unknown"
 
-    config = configparser.ConfigParser(strict=False)
-    config.read(git_config_path)
+    config = git_utils.read_git_config(git_config_path)
+    if config is None:
+        return None
 
     for k, v in config.items():
-        if k.startswith('remote ') and 'url' in v:
+        if k.startswith('remote ') and v.get('url'):
             return v['url'].replace("git@github.com:", "https://github.com/")
 
     return None
@@ -3527,10 +3600,14 @@ def resolve_giturl_from_path(fullpath):
 def repo_switch_commit(repo_path, commit_hash):
     try:
         repo = git.Repo(repo_path)
-        if repo.head.commit.hexsha == commit_hash:
-            return False
+        if repo.head.commit.hexsha != commit_hash:
+            repo.git.checkout(commit_hash)
+            repo.git.submodule('update', '--init', '--recursive')
+            return True
 
-        repo.git.checkout(commit_hash)
-        return True
+        # an update of the submodules that failed is done again; one that was never fetched is left alone
+        if os.path.exists(os.path.join(repo_path, '.gitmodules')):
+            repo.git.submodule('update', '--recursive')
+        return False
     except Exception:
         return None
